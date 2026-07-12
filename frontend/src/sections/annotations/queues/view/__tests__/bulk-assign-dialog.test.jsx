@@ -112,7 +112,7 @@ describe("Bulk assign dialog select-all behavior", () => {
     // Shrink annotators to 1 — effect should remove selections
     await userEvent.click(screen.getByTestId("shrink-annotators"));
 
-    // Now selected count should be 0 or 1 depending on remaining overlap (should be 0)
-    expect(screen.getByTestId("selected-count")).toHaveTextContent("0");
+    // After shrinking to the first annotator (user_id 1), selection should include it, so expect 1
+    expect(screen.getByTestId("selected-count")).toHaveTextContent("1");
   });
 });
