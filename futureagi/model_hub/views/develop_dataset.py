@@ -23,19 +23,6 @@ import pandas as pd
 import requests
 import structlog
 import weaviate
-from accounts.models.user import User
-from agentic_eval.core.embeddings.embedding_manager import (
-    EmbeddingManager,
-    model_manager,
-)
-from agentic_eval.core_evals.fi_evals import *  # noqa: F403
-from agentic_eval.core_evals.fi_utils.token_count_helper import calculate_total_cost
-from agentic_eval.core_evals.run_prompt.litellm_response import RunPrompt
-from analytics.utils import (
-    MixpanelEvents,
-    get_mixpanel_properties,
-    track_mixpanel_event,
-)
 from django.core.exceptions import ValidationError
 from django.db import close_old_connections, connection, transaction
 from django.db.models import (
@@ -61,6 +48,32 @@ from django.utils import timezone
 from docx import Document
 from drf_yasg import openapi
 from drf_yasg.utils import swagger_auto_schema
+from pinecone import Pinecone
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
+from qdrant_client import QdrantClient
+from rest_framework import serializers, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.generics import CreateAPIView
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from weaviate import AuthApiKey
+
+from accounts.models.user import User
+from agentic_eval.core.embeddings.embedding_manager import (
+    EmbeddingManager,
+    model_manager,
+)
+from agentic_eval.core_evals.fi_evals import *  # noqa: F403
+from agentic_eval.core_evals.fi_utils.token_count_helper import calculate_total_cost
+from agentic_eval.core_evals.run_prompt.litellm_response import RunPrompt
+from analytics.utils import (
+    MixpanelEvents,
+    get_mixpanel_properties,
+    track_mixpanel_event,
+)
 from evaluations.constants import AGENT_EVALUATOR_TYPE_ID, FUTUREAGI_EVAL_TYPES
 from model_hub.constants import (
     CREATE_KB_SDK_CODE,
@@ -257,17 +270,6 @@ from model_hub.views.utils.utils import (
     update_column_id,
     validate_file_url,
 )
-from pinecone import Pinecone
-from pypdf import PdfReader
-from pypdf.errors import PdfReadError
-from qdrant_client import QdrantClient
-from rest_framework import serializers, status, viewsets
-from rest_framework.decorators import action
-from rest_framework.generics import CreateAPIView
-from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-from rest_framework.views import APIView
 from sdk.utils.helpers import _get_api_call_type
 from tfc.constants.api_calls import APICallStatusChoices, APICallTypeChoices
 
@@ -300,7 +302,6 @@ from tfc.utils.storage import (
     upload_file_to_s3,
     upload_image_to_s3,
 )
-from weaviate import AuthApiKey
 
 try:
     from ee.usage.utils.usage_entries import (
@@ -5480,45 +5481,32 @@ class UpdateCellValueView(APIView):
                         new_value = self._convert_to_base64(request)
                     logger.info("GOT AUDIO BASE64")
 
-                    # Handle empty audio value
-                    if not new_value or (
-                        isinstance(new_value, str) and new_value.strip() == ""
-                    ):
-                        cell.value = None
-                        cell.value_infos = json.dumps({})
-                        cell.status = CellStatus.PASS.value
-                        cleared_metadata = dict(cell.column_metadata or {})
-                        cleared_metadata.pop("audio_duration_seconds", None)
-                        cell.column_metadata = cleared_metadata
+                    audio_key = f"audio/{dataset_id}/{uuid.uuid4()}"
+                    existing_metadata = dict(cell.column_metadata or {})
+                    audio_url, duration = upload_audio_to_s3_duration(
+                        new_value,
+                        bucket_name="fi-customer-data-dev",
+                        object_key=audio_key,
+                        duration_seconds=(
+                            existing_metadata.get("audio_duration_seconds")
+                            if new_value == cell.value
+                            else None
+                        ),
+                    )
+                    value_infos = (
+                        json.loads(cell.value_infos) if cell.value_infos else {}
+                    )
+                    if not isinstance(value_infos, dict):
+                        value_infos = {}
+                    value_infos["audio_url"] = audio_url
+                    cell.value_infos = json.dumps(value_infos)
+                    cell.status = CellStatus.PASS.value
+                    cell.value = audio_url
+                    if duration is not None:
+                        existing_metadata["audio_duration_seconds"] = float(duration)
                     else:
-                        audio_key = f"audio/{dataset_id}/{uuid.uuid4()}"
-                        existing_metadata = dict(cell.column_metadata or {})
-                        audio_url, duration = upload_audio_to_s3_duration(
-                            new_value,
-                            bucket_name="fi-customer-data-dev",
-                            object_key=audio_key,
-                            duration_seconds=(
-                                existing_metadata.get("audio_duration_seconds")
-                                if new_value == cell.value
-                                else None
-                            ),
-                        )
-                        value_infos = (
-                            json.loads(cell.value_infos) if cell.value_infos else {}
-                        )
-                        if not isinstance(value_infos, dict):
-                            value_infos = {}
-                        value_infos["audio_url"] = audio_url
-                        cell.value_infos = json.dumps(value_infos)
-                        cell.status = CellStatus.PASS.value
-                        cell.value = audio_url
-                        if duration:
-                            existing_metadata["audio_duration_seconds"] = float(
-                                duration
-                            )
-                        else:
-                            existing_metadata.pop("audio_duration_seconds", None)
-                        cell.column_metadata = existing_metadata
+                        existing_metadata.pop("audio_duration_seconds", None)
+                    cell.column_metadata = existing_metadata
 
                 except Exception as e:
                     logger.error(f"ERROR: {e}")
@@ -6613,8 +6601,9 @@ class DownloadDatasetView(APIView):
             )
 
 
-from model_hub.models.choices import OwnerChoices  # noqa: E402
 from rest_framework import serializers  # noqa: E402
+
+from model_hub.models.choices import OwnerChoices  # noqa: E402
 
 
 class TemplateEvalSerializer(serializers.Serializer):
@@ -7106,7 +7095,8 @@ class GetEvalsListView(APIView):
                     ).order_by("version_number"),
                     to_attr="_prefetched_versions",
                 ),
-            ).select_related("organization")
+            )
+            .select_related("organization")
         )
 
         if search_text:
@@ -8008,9 +7998,9 @@ class EditAndRunUserEvalView(APIView):
                     if has_function_params_schema(new_config):
                         for key, value in input_params.items():
                             if key in new_config.get("function_params_schema", {}):
-                                new_config["function_params_schema"][key][
-                                    "default"
-                                ] = value
+                                new_config["function_params_schema"][key]["default"] = (
+                                    value
+                                )
                     new_template.config = new_config
                     new_template.save()
                     # Assign the full object (not just _id) so the FK cache
@@ -8364,9 +8354,9 @@ class AddUserEvalView(CreateAPIView):
                     if has_function_params_schema(new_config):
                         for key, value in input_params.items():
                             if key in new_config.get("function_params_schema", {}):
-                                new_config["function_params_schema"][key][
-                                    "default"
-                                ] = value
+                                new_config["function_params_schema"][key]["default"] = (
+                                    value
+                                )
                     new_template.config = new_config
                     new_template.save()
                     template_id = new_template.id
@@ -14948,6 +14938,7 @@ class CreateKnowledgeBaseView(APIView):
         self, file_bytes, file_name, kb_id, file_id, org_id=None
     ):
         from django.db import close_old_connections, connection
+
         from tfc.utils.storage import upload_file_to_s3
 
         try:
